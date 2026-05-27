@@ -23,6 +23,54 @@ library(RColorBrewer)
 library(pheatmap)
 ```
 
+# Overview
+
+Load CoGAPS patterns generated from single-cell RNAseq expression data, project them onto human bulk RNAseq data, and evaluate patterns as well as genes of interest with respect to clinically-relevant grouping variables.  
+
+Required inputs:
+
+1. Bulk RNAseq expression matrix - rows are genes, columns are samples
+1. Metadata - rows are samples, must match expression matrix columns. Colummns include any plotting/grouping variables desired
+1. CoGAPS pattern file
+1. Immune Activation reference
+1. Human mouse mapping
+
+Initial project ([Roussos Torres](https://www.nature.com/articles/s43018-024-00729-w)), has response groups evaluated by RECIST and measurements across multiple time points, which will be the main parameters (see below).
+
+## Set Parameters
+
+Depending on the project, set the analysis parameters.
+
+1. `projName_v` - name of project for plot titles
+1. `geneCol_v` - the name of the column in the counts data.table that contains gene names. Becomes rownames when converting to data.frame
+1. `idCol_v` - the name of the column in the metadata data.table that matches the colnames of the counts table. This becomes rownames when converting to data.frame
+1. `timeCol_v` - the name of the column in the metadata that contains the time designations. Roussos Torres uses `Timepoint`
+1. `timeLevels_v` - the factor levels for timeCol_v in order of earliest to latest timepoint. Roussos Torres uses `Baseline`, `Post_RunIn`, `Week_8`
+1. `groupCol_v` - the name of the column in the metadata that contains the group designations. Roussos Torres uses `RECIST`
+1. `groupLevels_v` - the factor levels for groupCol_v in order of "less-treated"/"worse response" to "more-treated"/"better response". Roussos Torres uses `NonResponder` and `Responder`
+1. `genes_v` - gene names of genes to be tested
+1. `patternCols_v` - names of the CoGAPS patterns. Should just be Pattern_1 through Pattern_10
+1. `shapeCol_v` - optional metadata column that controls shape in plots. Roussos Torres uses `Subtype`
+
+```{r}
+projName_v <- "Roussos Torres"
+
+geneCol_v <- "gene"
+idCol_v <- "ID"
+
+timeCol_v <- "Timepoint"
+#timeLevels_v <- c("Baseline", "Post_RunIn", "Week_8")
+timeLevels_v <- c("Baseline", "Week_8")
+
+groupCol_v <- "RECIST"
+groupLevels_v <- c("NonResponder", "Responder")
+
+shapeCol_v <- "Subtype"
+
+genes_v <- c("MIF", "CD74", "EGFR")
+patternCols_v <- paste0("Pattern_", 1:10)
+```
+
 # Helper Functions
 
 ```{r}
@@ -80,40 +128,6 @@ Read them in (data.table)
 ```{r read}
 counts_dt <- fread(file.path(dataDir_v, countName_v))
 meta_dt <- fread(file.path(dataDir_v, metaName_v))
-```
-
-# Set Parameters
-
-Depending on the project, set the analysis parameters.
-
-1. `projName_v` - name of project for plot titles
-1. `geneCol_v` - the name of the column in the counts data.table that contains gene names. Becomes rownames when converting to data.frame
-1. `idCol_v` - the name of the column in the metadata data.table that matches the colnames of the counts table. This becomes rownames when converting to data.frame
-1. `timeCol_v` - the name of the column in the metadata that contains the time designations. Roussos Torres uses `Timepoint`
-1. `timeLevels_v` - the factor levels for timeCol_v in order of earliest to latest timepoint. Roussos Torres uses `Baseline`, `Post_RunIn`, `Week_8`
-1. `groupCol_v` - the name of the column in the metadata that contains the group designations. Roussos Torres uses `RECIST`
-1. `groupLevels_v` - the factor levels for groupCol_v in order of "less-treated"/"worse response" to "more-treated"/"better response". Roussos Torres uses `NonResponder` and `Responder`
-1. `genes_v` - gene names of genes to be tested
-1. `patternCols_v` - names of the CoGAPS patterns. Should just be Pattern_1 through Pattern_10
-1. `shapeCol_v` - optional metadata column that controls shape in plots. Roussos Torres uses `Subtype`
-
-```{r}
-projName_v <- "Roussos Torres"
-
-geneCol_v <- "gene"
-idCol_v <- "ID"
-
-timeCol_v <- "Timepoint"
-#timeLevels_v <- c("Baseline", "Post_RunIn", "Week_8")
-timeLevels_v <- c("Baseline", "Week_8")
-
-groupCol_v <- "RECIST"
-groupLevels_v <- c("NonResponder", "Responder")
-
-shapeCol_v <- "Subtype"
-
-genes_v <- c("MIF", "CD74", "EGFR")
-patternCols_v <- paste0("Pattern_", 1:10)
 ```
 
 # Subset
@@ -562,7 +576,7 @@ heatmapForceColumnOrder <- pheatmap(mat                  = toPlot_df,
                                     cellheight           = NA, 
                                     fontsize             = 10,
                                     #gaps_col = c(14, 30), # all tp
-                                    gaps_col = c(14), # all tp
+                                    gaps_col = c(14), # remove middle time 
                                     gaps_row = c(10, 18, 30),
                                     scale                = "row",
                                     annotation_legend    = T,
@@ -596,7 +610,7 @@ heatmapClusterColumns <- pheatmap(mat                 = toPlot_df,
                                   silent = T, 
                                   main = paste0(projName_v, " Immune Activation Genes\nRow-scaled VST"))
 
-pdf(file = file.path(baseOutDir_v, "columnCluster_immActHeatmap.pdf"), height = 10, width = 7)
+pdf(file = file.path(heatDir_v, "columnCluster_immActHeatmap.pdf"), height = 10, width = 7)
 grid::grid.draw(heatmapClusterColumns)
 dev.off()
 ```
@@ -634,7 +648,7 @@ for (tp_v in timeLevels_v) {
   
   timePointHeat_ls[[tp_v]] <- currentHeat
   
-  pdf(file = file.path(baseOutDir_v, paste0(tp_v, "_heatmap.pdf")), height = 10, width = 6)
+  pdf(file = file.path(heatDir_v, paste0(tp_v, "_heatmap.pdf")), height = 10, width = 6)
   grid::grid.draw(currentHeat)
   dev.off()
   
