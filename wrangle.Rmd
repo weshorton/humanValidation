@@ -1,0 +1,124 @@
+---
+title: "Bulk RNA Analysis"
+subtitle: "Wrangle"
+author: "Wes Horton"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+---
+
+```{r loadLibs}
+### Load Utils package
+if (!require("wrh.rUtils")) remotes::install_github("weshorton/wrh.rUtils")
+
+library(data.table)
+library(wrh.rUtils)
+```
+
+# Load Data
+
+Set the main directory as well as the sub-directory for the input files
+
+```{r set directories}
+baseDir_v <- "~/my_tool_repos/humanValidation/"
+dataDir_v <- mkdir(baseDir_v, "inputs")
+```
+
+Specify file names for counts and meta
+
+```{r file names}
+countName_v <- "j15221_evanthia_breast_rnaseq_deidentified.tsv"
+metaName_v <- "table_24patient_info.csv"
+```
+
+Read them in (data.table)
+
+```{r read}
+counts_dt <- fread(file.path(dataDir_v, countName_v))
+meta_dt <- fread(file.path(dataDir_v, metaName_v))
+```
+
+# Harmonize Samples
+
+Depending on the project, the metadata may describe more samples than are present in the count data.  
+
+Process will depend on the specific project, but at the end of this, the metadata and the count data should have the same samples.
+
+```{r harmonize}
+# Sample names in the count data are a combination of the patient ID and Timepoint, separated by underscore
+# Sample names in the metadata are simply the patient ID
+
+# Get unique sample names from RNAseq data
+countSamples_v <- unique(gsub("_.*$", "", grep("^R", colnames(counts_dt), value = T)))
+
+# Check
+inCountNotMeta_v <- setdiff(countSamples_v, meta_dt$ID) # Should be empty
+inMetaNotCount_v <- setdiff(meta_dt$ID, countSamples_v)
+
+# Update
+cat(sprintf("%s samples are in the metadata sheet, but don't have RNAseq data:\n\t%s", length(inMetaNotCount_v), paste(inMetaNotCount_v, collapse = "\n\t")))
+
+# Remove from meta
+meta_dt <- meta_dt[!(ID %in% inMetaNotCount_v),]
+```
+
+# Wrangle Meta for DESeq
+
+The metadata only has one row per sample while the count data has multiple columns per sample (multiple timepoints).  
+
+DESeq functions require the metadata rows to exactly match the count columns, so the metadata will need to be "duplicated".  
+
+Since each patient has a variable number of timepoints (i.e. not all patients have all timepoints), make them all and then subset.
+
+```{r}
+# Specify the timepoints for the project
+timePoints_v <- c("Baseline", "Post Run-in", "Week 8")
+
+# Specify the gene column name (this is the only column in the count table that isn't a measurement)
+geneCol_v <- "gene"
+
+# Copy the original ID (this will no longer be unique)
+meta_dt$patientID <- meta_dt$ID
+
+# Iterate over each timepoint, replacing the original ID with new ID_Timepoint
+meta_lsdt <- list()
+for (tp_v in timePoints_v) {
+  tmpMeta_dt <- copy(meta_dt)
+  tmpMeta_dt$Timepoint <- tp_v
+  tmpMeta_dt$ID <- paste(tmpMeta_dt$ID, tp_v, sep = "_")
+  meta_lsdt[[tp_v]] <- tmpMeta_dt
+}
+
+# Combine them all together
+allMeta_dt <- do.call(rbind, meta_lsdt)
+
+# Subset to only have rows that have count columns
+allMeta_dt <- allMeta_dt[ID %in% colnames(counts_dt),]
+
+# Sort rows to match count columns
+allMeta_dt <- allMeta_dt[match(setdiff(colnames(counts_dt), geneCol_v), ID),]
+
+# Double check
+if (!identical(allMeta_dt$ID, setdiff(colnames(counts_dt), "gene"))) stop("Something is wrong with metadata rows and/or count columns.\n")
+```
+
+DESeq also doesn't like dashes and spaces in variables, so clean those as well.
+
+```{r}
+# Change Post Run-in to Post_RunIn and Week 8 to Week_8
+allMeta_dt$Timepoint <- gsub(" ", "_", gsub("\\-in", "In", allMeta_dt$Timepoint))
+
+# Change Non-responder to NonResponder
+allMeta_dt$RECIST <- gsub("\\-r", "R", allMeta_dt$RECIST)
+```
+
+# Output
+
+Write out cleaned data
+
+```{r}
+write.csv(counts_dt, file = file.path(dataDir_v, "cleanCounts.csv"), row.names = F, quote = F)
+write.csv(allMeta_dt, file = file.path(dataDir_v, "cleanMetadata.csv"), row.names = F, quote = F)
+```
+

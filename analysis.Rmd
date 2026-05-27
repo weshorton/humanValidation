@@ -1,0 +1,647 @@
+---
+title: "Bulk RNA Analysis"
+subtitle: "Analysis"
+author: "Wes Horton"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+---
+
+```{r loadLibs, message=F}
+### Load Utils package
+if (!require("wrh.rUtils")) remotes::install_github("weshorton/wrh.rUtils")
+
+library(data.table)
+library(DESeq2)
+library(projectR)
+library(CoGAPS)
+library(wrh.rUtils)
+library(ggplot2)
+library(ggpubr)
+library(RColorBrewer)
+library(pheatmap)
+```
+
+# Helper Functions
+
+```{r}
+getCorStat <- function(x, y, method_v = "pearson") {
+  #' Get Corr Stat
+  #' @details run correlation on provided vectors and format output
+  #' @param x first vector
+  #' @param y second vector
+  #' @param method_v method to pass to cor.test(). Default is "pearson"
+  #' @export
+  
+  ### Correlation only works with sufficient observations. 
+  ### Return blank if fewer than 3 actual paired values in x and y
+  keep_v <- complete.cases(x, y)
+  if (sum(keep_v) < 3) {
+    warning("Fewer than 3 non-missing paired values in provided vectors.\n")
+    return(data.frame(n = sum(keep_v), correlation = NA_real_, p_value = NA_real_))
+  }
+  
+  ### Run test
+  fit <- cor.test(x[keep_v], y[keep_v], method = method_v)
+  
+  ### Build output
+  out_df <- data.frame("n" = sum(keep_v),
+                       "correlation" = unname(fit$estimate),
+                       "p_value" = fit$p.value)
+  
+  ### Return
+  return(out_df)
+  
+} # getCorStat
+```
+
+# Load Data
+
+The data should already be wrangled into a usable format before loading here.
+
+Set the main directory as well as the sub-directory for the input files and outputs
+
+```{r set directories}
+baseDir_v <- "~/my_tool_repos/humanValidation/"
+dataDir_v <- mkdir(baseDir_v, "inputs")
+baseOutDir_v <- mkdir(baseDir_v, "outputs")
+```
+
+Specify file names for counts and meta
+
+```{r file names}
+countName_v <- "cleanCounts.csv"
+metaName_v <- "cleanMetadata.csv"
+```
+
+Read them in (data.table)
+
+```{r read}
+counts_dt <- fread(file.path(dataDir_v, countName_v))
+meta_dt <- fread(file.path(dataDir_v, metaName_v))
+```
+
+# Set Parameters
+
+Depending on the project, set the analysis parameters.
+
+1. `projName_v` - name of project for plot titles
+1. `geneCol_v` - the name of the column in the counts data.table that contains gene names. Becomes rownames when converting to data.frame
+1. `idCol_v` - the name of the column in the metadata data.table that matches the colnames of the counts table. This becomes rownames when converting to data.frame
+1. `timeCol_v` - the name of the column in the metadata that contains the time designations. Roussos Torres uses `Timepoint`
+1. `timeLevels_v` - the factor levels for timeCol_v in order of earliest to latest timepoint. Roussos Torres uses `Baseline`, `Post_RunIn`, `Week_8`
+1. `groupCol_v` - the name of the column in the metadata that contains the group designations. Roussos Torres uses `RECIST`
+1. `groupLevels_v` - the factor levels for groupCol_v in order of "less-treated"/"worse response" to "more-treated"/"better response". Roussos Torres uses `NonResponder` and `Responder`
+1. `genes_v` - gene names of genes to be tested
+1. `patternCols_v` - names of the CoGAPS patterns. Should just be Pattern_1 through Pattern_10
+1. `shapeCol_v` - optional metadata column that controls shape in plots. Roussos Torres uses `Subtype`
+
+```{r}
+projName_v <- "Roussos Torres"
+
+geneCol_v <- "gene"
+idCol_v <- "ID"
+
+timeCol_v <- "Timepoint"
+#timeLevels_v <- c("Baseline", "Post_RunIn", "Week_8")
+timeLevels_v <- c("Baseline", "Week_8")
+
+groupCol_v <- "RECIST"
+groupLevels_v <- c("NonResponder", "Responder")
+
+shapeCol_v <- "Subtype"
+
+genes_v <- c("MIF", "CD74", "EGFR")
+patternCols_v <- paste0("Pattern_", 1:10)
+```
+
+# Subset
+
+If `timeLevels_v` or `groupLevels_v` don't contain all the possible values in the metadata, have to subset before doing anything
+
+```{r}
+# Subset metadata
+meta_dt <- meta_dt[get(timeCol_v) %in% timeLevels_v,]
+meta_dt <- meta_dt[get(groupCol_v) %in% groupLevels_v,]
+
+# Subset data
+counts_dt <- counts_dt[,mget(c(geneCol_v, meta_dt[[idCol_v]]))]
+
+# Check
+if (!identical(setdiff(colnames(counts_dt), geneCol_v), meta_dt[[idCol_v]])) stop("Messed up subset. Data columns and meta rows don't match.\n")
+```
+
+# DESeq
+
+```{r DESeq}
+# Change to data.frame for DESeq
+countData_df <- convertDFT(counts_dt, col_v = geneCol_v)
+colData_df <- convertDFT(meta_dt, col_v = idCol_v)
+
+# Factorize
+colData_df[[timeCol_v]] <- factor(colData_df[[timeCol_v]], levels = timeLevels_v)
+colData_df[[groupCol_v]] <- factor(colData_df[[groupCol_v]], levels = groupLevels_v)
+
+# Build design
+design_form <- as.formula(paste("~", timeCol_v, "*", groupCol_v))
+
+# Create DESeq Object
+dds <- DESeqDataSetFromMatrix(countData = countData_df,
+                              colData = colData_df,
+                              design = design_form)
+
+# Get vst data
+vstData <- assay(vst(dds))
+
+# Filter out rows with no variance (~650 genes)
+vstData <- vstData[apply(vstData, 1, sd) > 0,]
+```
+
+# Project CoGAPS Patterns
+
+We have 10 CoGAPS Patterns generated from the B cell cluster of single-cell RNAseq data.  
+Project these mouse-derived B cell patterns into the human bulk data.
+
+```{r project patterns}
+# Read in patterns and gene-mapping
+load(file.path(dataDir_v, "cBCellgres10.Rda"))
+humanGenesConv <- readRDS(file.path(dataDir_v, "HumanMouseMap_mart.rds"))
+
+# Project
+  # One row per CoGAPS pattern
+  # one column per idCol_v value
+prRNA <- projectR(data = as.matrix(vstData),
+                  dataNames = rownames(vstData),
+                  loadings = getAmplitudeMatrix(cg),
+                  loadingsNames = humanGenesConv[rownames(getAmplitudeMatrix(cg))],
+                  full = TRUE)
+
+# Transpose and merge with meta
+prRNA_dt <- merge(myT(prRNA$projection, newName_v = idCol_v), meta_dt, by = idCol_v, sort = F)
+
+# Re-factorize
+prRNA_dt[[timeCol_v]] <- factor(prRNA_dt[[timeCol_v]], levels = timeLevels_v)
+prRNA_dt[[groupCol_v]] <- factor(prRNA_dt[[groupCol_v]], levels = groupLevels_v)
+```
+
+# Add Genes of interest
+
+```{r add genes}
+# Get genes
+tmp_df <- vstData[rownames(vstData) %in% genes_v,]
+
+# Merge
+prRNA_dt <- merge(prRNA_dt, myT(tmp_df, newName_v = idCol_v), by = idCol_v)
+```
+
+# Compare Group differences within each Timepoint - Pattern
+
+For each CoGAPS pattern, plot groups, split by timepoint.
+
+Instead of facetting by timepoint, make one plot per so they can be combined variously.
+
+```{r}
+boxDir_v <- mkdir(baseOutDir_v, "patternBoxplot")
+sigDir_v <- mkdir(boxDir_v, "significant")
+insigDir_v <- mkdir(boxDir_v, "notSignificant")
+```
+
+```{r, fig.width=10, fig.height=6}
+# Run for each Pattern
+results_lsdt <- list()
+for (i in 1:length(patternCols_v)) {
+  
+  # Get info
+  currPattern_v <- patternCols_v[i]
+  currFormula_v <- as.formula(paste(currPattern_v, "~", groupCol_v))
+  
+  # Run for each time
+  currBox_lsgg <- currResults_lsdt <- list()
+  for (j in 1:length(timeLevels_v)) {
+    
+    # Get info
+    currTime_v <- timeLevels_v[j]
+    currData_dt <- prRNA_dt[get(timeCol_v) == currTime_v,]
+    
+    # Make base plot
+    currBox_gg <- ggplot(currData_dt, aes(x = !!sym(groupCol_v), y = !!sym(currPattern_v))) +
+      geom_boxplot() +
+      stat_compare_means(method = "t.test") +
+      ggtitle(paste0(currPattern_v, " - ", currTime_v)) +
+      my_theme() +
+      theme(legend.position = "bottom")
+    
+    # Add points
+    if (is.null(shapeCol_v)) {
+      currBox_gg <- currBox_gg + geom_point(size = 3)
+    } else {
+      currBox_gg <- currBox_gg + geom_point(aes(shape = !!sym(shapeCol_v)), size = 3)
+    }
+    
+    # Get results
+    currResults_dt <- as.data.table(compare_means(formula = currFormula_v, data = currData_dt, method = "t.test"))
+    
+    # Add plot and results to lists
+    currBox_lsgg[[currTime_v]] <- currBox_gg
+    currResults_lsdt[[currTime_v]] <- currResults_dt
+    
+    # Get directory based on p-value
+    currDir_v <- ifelse(currResults_dt$p.format < 0.05, sigDir_v, insigDir_v)
+    
+    # Save plot
+    pdf(file = file.path(currDir_v, paste0(currPattern_v, "_", currTime_v, "_compare_", groupCol_v, ".pdf")), width = 5, height = 6)
+    print(currBox_gg)
+    dev.off()
+    
+  } # for j
+  
+  # Combine results and add to final list
+  currResults_dt <- dtListBind(currResults_lsdt, newName_v = timeCol_v)
+  results_lsdt[[currPattern_v]] <- currResults_dt
+  
+  # Combine plots
+  currCombo_gg <- ggarrange(plotlist = currBox_lsgg, nrow = 1, ncol = length(timeLevels_v), common.legend = T, legend = "bottom")
+  
+  # Check significance
+  currPvalues_v <- currResults_dt$p.format
+  checkSig_v <- (length(which(currPvalues_v < 0.05)) > 0)
+  
+  # Get directory based on p-value
+  currDir_v <- ifelse(checkSig_v, sigDir_v, insigDir_v)
+  
+  # Print based on p-value
+  if (checkSig_v) print(currCombo_gg)
+  
+  # Save plot
+  pdf(file = file.path(currDir_v, paste0(currPattern_v, "_allTimePoints_compare_", groupCol_v, ".pdf")), width = 5*length(timeLevels_v), height = 6)
+  print(currCombo_gg)
+  dev.off()
+  
+} # for i
+
+# Combine results and save
+results_dt <- do.call(rbind, results_lsdt)
+writeCSVorExcel(results_dt, file.path(boxDir_v, paste0("patterns_allTimePoints_compare_", groupCol_v, ".csv")))
+```
+
+# Compare Group differences within each Timepoint - Gene
+
+For each gene, plot groups, split by timepoint.
+
+With fewer genes, want them side-by-side
+
+```{r}
+boxDir_v <- mkdir(baseOutDir_v, "geneBoxplot")
+sigDir_v <- mkdir(boxDir_v, "significant")
+insigDir_v <- mkdir(boxDir_v, "notSignificant")
+```
+
+```{r}
+# Melt
+prRNA_melt_dt <- melt(prRNA_dt, measure.vars = genes_v, variable.name = geneCol_v, value.name = "Expression")
+
+# Factor
+prRNA_melt_dt[[geneCol_v]] <- factor(prRNA_melt_dt[[geneCol_v]], levels = genes_v)
+
+box_lsgg <- results_lsdt <- list()
+for (i in 1:length(timeLevels_v)) {
+  
+  # Get info
+  currTime_v <- timeLevels_v[i]
+  currData_dt <- prRNA_melt_dt[get(timeCol_v) == currTime_v,]
+  
+  # Make base plot
+  currBox_gg <- ggplot(currData_dt, aes(x = !!sym(groupCol_v), y = Expression)) +
+    geom_boxplot() +
+    facet_wrap(as.formula(paste("~", geneCol_v))) +
+    stat_compare_means(method = "t.test") +
+    ggtitle(currTime_v) +
+    my_theme() +
+    theme(legend.position = "bottom")
+  
+  # Add points
+  if (is.null(shapeCol_v)) {
+    currBox_gg <- currBox_gg + geom_point(size = 3)
+  } else {
+    currBox_gg <- currBox_gg + geom_point(aes(shape = !!sym(shapeCol_v)), size = 3)
+  }
+  
+  # Get results
+  currResults_dt <- as.data.table(compare_means(formula = as.formula(paste0("Expression ~ ", groupCol_v)), data = currData_dt, method = "t.test", group.by = geneCol_v))
+  
+  # Add to lists
+  box_lsgg[[currTime_v]] <- currBox_gg
+  results_lsdt[[currTime_v]] <- currResults_dt
+  
+  # Check Significance
+  currPvalues_v <- currResults_dt$p.format
+  checkSig_v <- (length(which(currPvalues_v < 0.05)) > 0)
+  
+  # Get directory based on p-value
+  currDir_v <- ifelse(checkSig_v, sigDir_v, insigDir_v)
+  
+  # Print based on p-value
+  if (checkSig_v) print(currBox_gg)
+  
+  # Save
+  pdf(file = file.path(currDir_v, paste0("geneExpr_", currTime_v, "_compare_", groupCol_v, ".pdf")), width = 10, height = 6)
+  print(currBox_gg)
+  dev.off()
+  
+}
+
+# Combine results
+results_dt <- dtListBind(results_lsdt, newName_v = timeCol_v)
+
+# Combine plots
+combo_gg <- ggarrange(plotlist = box_lsgg, ncol = 1, nrow = length(timeLevels_v), common.legend = T, legend = "right")
+
+# Check significances
+pValues_v <- results_dt$p.format
+checkSig_v <- (length(which(pValues_v < 0.05)) > 0)
+  
+# Get directory based on p-value
+outDir_v <- ifelse(checkSig_v, sigDir_v, insigDir_v)
+
+# Print combo
+pdf(file = file.path(outDir_v, paste0("geneExpr_allTimePoints_compare_", groupCol_v, ".pdf")), width = 10, height = 6*length(timeLevels_v))
+print(combo_gg)
+dev.off()
+```
+
+# Correlate Patterns with genes
+
+```{r}
+corrDir_v <- mkdir(baseOutDir_v, "genePatternCorrelation")
+```
+
+```{r}
+geneCorr_lsdf <- list()
+for (i in 1:length(genes_v)) {
+  
+  # Get info
+  currGene_v <- genes_v[i]
+  
+  tmp_ls <- list()
+  for (j in 1:length(timeLevels_v)) {
+    
+    # Get info
+    currTime_v <- timeLevels_v[j]
+    currData_dt <- prRNA_dt[get(timeCol_v) == currTime_v,]
+    
+    # Run correlations
+    currCorr_lsdf <- lapply(patternCols_v, function(pc_v) {
+      df <- cbind(currTime_v, pc_v, currGene_v, getCorStat(x = currData_dt[[pc_v]], y = currData_dt[[currGene_v]]))
+      colnames(df) <- c(timeCol_v, "pattern", "metric", "n", "correlation", "p_value")
+      return(df)
+    })
+    
+    # Combine and add
+    currCorr_df <- do.call(rbind, currCorr_lsdf)
+    tmp_ls[[currTime_v]] <- currCorr_df
+    
+  } # for j
+  
+  # Combine again
+  currCorr_df <- do.call(rbind, tmp_ls)
+  
+  # Add to final
+  geneCorr_lsdf[[currGene_v]] <- currCorr_df
+  
+} # for i
+
+myOpenXWriteWkbk(geneCorr_lsdf, file_v = file.path(corrDir_v, "genePatternCorrelationResults.xlsx"))
+```
+
+```{r}
+for (i in 1:length(genes_v)) {
+  
+  # Get info
+  currGene_v <- genes_v[i]
+  currCorr_df <- geneCorr_lsdf[[currGene_v]]
+  
+  # Output locations
+  currOutDir_v <- mkdir(corrDir_v, currGene_v)
+  currSigDir_v <- mkdir(currOutDir_v, "significant")
+  currInSigDir_v <- mkdir(currOutDir_v, "inSignificant")
+  
+  # Subset for significant correlations
+  currSigCorr_df <- currCorr_df[currCorr_df$p_value < 0.05,]
+  currSigPatterns_v <- unique(currSigCorr_df$pattern)
+  
+  # Run per pattern
+  for (j in 1:length(patternCols_v)) {
+    
+    # Get info
+    currPattern_v <- patternCols_v[j]
+    
+    # Run per timepoint
+    currCorr_lsgg <- list()
+    for (k in 1:length(timeLevels_v)) {
+      
+      # Get info
+      currTime_v <- timeLevels_v[k]
+      currData_dt <- prRNA_dt[get(timeCol_v) == currTime_v]
+      currRes_df <- currCorr_df[currCorr_df[[timeCol_v]] == currTime_v & currCorr_df$pattern == currPattern_v,]
+      
+      # Make label
+      currLabel_v <- if (is.na(currRes_df$correlation)) {
+        paste("n =", currRes_df$n, "\nr = NA\np = NA")
+      } else {
+        sprintf("n = %d\nr = %.3f\np = %.3g", currRes_df$n, currRes_df$correlation, currRes_df$p_value)
+      } # fi is.na correlation
+      
+      # Make plot
+      currPlot_gg <- ggplot(currData_dt, aes(x = !!sym(currPattern_v), y = !!sym(currGene_v), color = !!sym(groupCol_v))) +
+        geom_point(size = 2.8, alpha = 0.85) +
+        geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.7) +
+        annotate("text", x = -Inf, y = Inf, label = currLabel_v, hjust = -0.1, vjust = 1.1) +
+        my_theme() +
+        labs(title = paste0(currGene_v, " with ", currPattern_v, "\n", currTime_v), x = currPattern_v, y = currGene_v)
+      
+      # Add to list
+      currCorr_lsgg[[currTime_v]] <- currPlot_gg
+      
+      # Determine significance
+      currSig_v <- currRes_df$p_value < 0.05
+      currDir_v <- ifelse(currSig_v, currSigDir_v, currInSigDir_v)
+      
+      # Save
+      pdf(file = file.path(currDir_v, paste0(currGene_v, "_correlate_", currPattern_v, "_", currTime_v, ".pdf")))
+      print(currPlot_gg)
+      dev.off()
+        
+    } # for k
+    
+    # Combine
+    currCombo_gg <- ggarrange(plotlist = currCorr_lsgg, nrow = 1, ncol = length(timeLevels_v), common.legend = T, legend = "bottom")
+    
+    # Determine significance
+    currSig_v <- currPattern_v %in% currSigPatterns_v
+    currDir_v <- ifelse(currSig_v, currSigDir_v, currInSigDir_v)
+    
+    # Print
+    if (currSig_v) print(currCombo_gg)
+    
+    # Save
+    pdf(file = file.path(currDir_v, paste0(currGene_v, "_correlate_", currPattern_v, "_allTimePoints.pdf")), height = 5, width = 5*length(timeLevels_v))
+    print(currCombo_gg)
+    dev.off()
+    
+  } # for j
+  
+} # for i
+```
+
+# Heatmap of Immune Activation Genes
+
+```{r}
+# Load data and convert
+immActRef_dt <- fread(file.path(dataDir_v, "immuneActivationGenes.csv"))
+immActRef_df <- convertDFT(immActRef_dt[, mget(c("Gene", "Category"))], col_v = "Gene")
+
+# Set colors
+categoryColors_v <- c("IFN-driven maturation" = "#D8762C", "DC-T cell synapse" = "#2DB08E", 
+                      "cDC2 (CD4 and Tfh priming)" = "#3076A7", "cDC1 (cross-presentation)" = "#254A65")
+
+heatDir_v <- mkdir(baseOutDir_v, "heatmap")
+```
+
+The annotation colors requires manual editing depending on the project.  
+Need as input a list with each element's name as a column in the metadata to be plotted as annotation
+and the values as the color values (with names)
+
+```{r}
+### Treatment Classifications
+treatClass_v <- brewer.pal(7, "Accent")
+names(treatClass_v) <- unique(meta_dt$latest_treatment_class)
+
+response_v <- c("NonResponder" = "red", "Responder" = "blue")
+
+timePointColors_v <- brewer.pal(3, "Dark2")
+names(timePointColors_v) <- timeLevels_v
+
+subtype_v <- brewer.pal(3, "Paired")[1:2]
+names(subtype_v) <- c("TNBC", "HR+")
+
+# Assemble
+annColors_lsv <- list("latest_treatment_class" = treatClass_v,
+                      "RECIST" = response_v,
+                      "Timepoint" = timePointColors_v,
+                      "Subtype" = subtype_v,
+                      "Category" = categoryColors_v)
+```
+
+## All timepoints
+
+```{r, fig.height=8}
+# Subset data and sort rows to match immune activation genes
+toPlot_df <- vstData[rownames(vstData) %in% immActRef_dt$Gene,]
+toPlot_df <- toPlot_df[match(immActRef_dt$Gene, rownames(toPlot_df)),]
+
+# Sort metadata and convert to data.frame
+setorderv(meta_dt, cols = c("Timepoint", "RECIST", "Subtype"))
+toPlot_meta_df <- convertDFT(meta_dt[,mget(c("ID", "Subtype", "Timepoint", "RECIST", "latest_treatment_class", "Dose_level"))], col_v = "ID")
+
+# Sort data to match metadata order
+toPlot_df <- toPlot_df[,rownames(toPlot_meta_df)]
+```
+
+```{r, fig.height=10, fig.width=7}
+# Make plot - force order
+heatmapForceColumnOrder <- pheatmap(mat                  = toPlot_df,
+                                    cluster_rows         = F,
+                                    show_rownames        = T,
+                                    cluster_cols         = F,
+                                    show_colnames        = T,
+                                    border_color         = NA,
+                                    annotation_col       = toPlot_meta_df,
+                                    annotation_row       = immActRef_df,
+                                    annotation_colors    = annColors_lsv,
+                                    cellheight           = NA, 
+                                    fontsize             = 10,
+                                    #gaps_col = c(14, 30), # all tp
+                                    gaps_col = c(14), # all tp
+                                    gaps_row = c(10, 18, 30),
+                                    scale                = "row",
+                                    annotation_legend    = T,
+                                    annotation_names_col = F,
+                                    annotation_names_row = F,
+                                    silent = F, 
+                                    main = paste0(projName_v, " Immune Activation Genes\nRow-scaled VST"))
+
+pdf(file = file.path(heatDir_v, "forceOrder_immActHeatmap.pdf"), height = 10, width = 7)
+grid::grid.draw(heatmapForceColumnOrder)
+dev.off()
+
+# Make plot
+heatmapClusterColumns <- pheatmap(mat                 = toPlot_df,
+                                  cluster_rows         = F,
+                                  show_rownames        = T,
+                                  cluster_cols         = T,
+                                  clustering_method = "average",
+                                  show_colnames        = T,
+                                  border_color         = NA,
+                                  annotation_col       = toPlot_meta_df,
+                                  annotation_row       = immActRef_df,
+                                  annotation_colors    = annColors_lsv,
+                                  cellheight           = NA, 
+                                  fontsize             = 10,
+                                  gaps_row = c(10, 18, 30),
+                                  scale                = "row",
+                                  annotation_legend    = T,
+                                  annotation_names_col = F,
+                                  annotation_names_row = F,
+                                  silent = T, 
+                                  main = paste0(projName_v, " Immune Activation Genes\nRow-scaled VST"))
+
+pdf(file = file.path(baseOutDir_v, "columnCluster_immActHeatmap.pdf"), height = 10, width = 7)
+grid::grid.draw(heatmapClusterColumns)
+dev.off()
+```
+
+## Individual timepoints
+
+```{r}
+timePointHeat_ls <- list()
+for (tp_v in timeLevels_v) {
+  
+  ### Subset for timepoint
+  currMeta_df <- toPlot_meta_df[toPlot_meta_df[[timeCol_v]] == tp_v,]
+  currData_df <- toPlot_df[,rownames(currMeta_df)]
+  
+  ### Make heatmap
+  currentHeat <- pheatmap(mat                  = currData_df,
+                          cluster_rows         = F,
+                          show_rownames        = T,
+                          cluster_cols         = T,
+                          show_colnames        = T,
+                          border_color         = NA,
+                          annotation_col       = currMeta_df,
+                          annotation_row       = immActRef_df,
+                          annotation_colors    = annColors_lsv,
+                          cellwidth            = 6,
+                          cellheight           = NA, 
+                          fontsize             = 10,
+                          gaps_row             = c(10, 18, 30),
+                          scale                = "row",
+                          annotation_legend    = T,
+                          annotation_names_col = F,
+                          annotation_names_row = F,
+                          silent               = T, 
+                          main                 = paste0(projName_v, " - ", tp_v, "\nImmune Activation Genes\nRow-scaled VST"))
+  
+  timePointHeat_ls[[tp_v]] <- currentHeat
+  
+  pdf(file = file.path(baseOutDir_v, paste0(tp_v, "_heatmap.pdf")), height = 10, width = 6)
+  grid::grid.draw(currentHeat)
+  dev.off()
+  
+}
+```
+
+
+```{r}
+sessionInfo()
+```
